@@ -39,9 +39,10 @@ def _get_inner_dit(model) -> torch.nn.Module:
 
 
 def _prepare_cond_image(image: torch.Tensor, latent_h: int, latent_w: int,
+                        batch_size: int,
                         device: torch.device, dtype: torch.dtype,
                         patch_spatial: int = 2) -> torch.Tensor:
-    """ComfyUI IMAGE (B,H,W,3) in [0,1] → (1,3,H*8,W*8) in [-1,1].
+    """ComfyUI IMAGE (B,H,W,3) in [0,1] → (B,3,H*8,W*8) in [-1,1].
 
     The LLLite ``conditioning1`` Conv has stride 16, so the cond image must be
     sized to ``latent_HW * 8`` in input pixel space (= ``token_HW * 16`` after
@@ -57,7 +58,6 @@ def _prepare_cond_image(image: torch.Tensor, latent_h: int, latent_w: int,
     else:
         raise ValueError(f"Unexpected cond image shape: {tuple(image.shape)} (expected B,H,W,3)")
 
-    img = img[:1]  # use first frame only
     padded_h = ((latent_h + patch_spatial - 1) // patch_spatial) * patch_spatial
     padded_w = ((latent_w + patch_spatial - 1) // patch_spatial) * patch_spatial
     target_h = padded_h * 8
@@ -65,6 +65,18 @@ def _prepare_cond_image(image: torch.Tensor, latent_h: int, latent_w: int,
     if img.shape[-2] != target_h or img.shape[-1] != target_w:
         img = F.interpolate(img, size=(target_h, target_w), mode="bicubic", align_corners=False)
         img = img.clamp(0.0, 1.0)
+
+    # Align conditioning batch with latent batch.
+    cond_b = int(img.shape[0])
+    if cond_b == 1 and batch_size > 1:
+        img = img.expand(batch_size, -1, -1, -1)
+    elif cond_b != batch_size:
+        if cond_b < batch_size:
+            raise ValueError(
+                f"Condition image batch ({cond_b}) must be 1 or >= latent batch ({batch_size})."
+            )
+        img = img[:batch_size]
+
     img = img * 2.0 - 1.0
     return img.to(device=device, dtype=dtype)
 
@@ -160,10 +172,11 @@ class AnimaLLLiteApply:
                 cache["lllite_loaded_to"] = tag
                 cache["cond_image_pp"] = None  # invalidate
 
-            key = (latent_h, latent_w, device, dtype)
+            batch_size = int(input_x.shape[0])
+            key = (latent_h, latent_w, batch_size, device, dtype)
             if cache["key"] != key or cache["cond_image_pp"] is None:
                 cache["cond_image_pp"] = _prepare_cond_image(
-                    src_image, latent_h, latent_w, device, dtype, patch_spatial
+                    src_image, latent_h, latent_w, batch_size, device, dtype, patch_spatial
                 )
                 cache["key"] = key
 
